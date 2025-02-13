@@ -1,26 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015, Linaro Limited
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 #include <linux/arm-smccc.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
+#include <linux/mmap_lock.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/tee_drv.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
-#include <linux/mmap_lock.h>
 #include "optee_private.h"
 #include "optee_smc.h"
 
@@ -158,6 +150,8 @@ u32 optee_do_call_with_arg(struct tee_context *ctx, phys_addr_t parg)
 			 */
 			optee_cq_wait_for_completion(&optee->call_queue, &w);
 		} else if (OPTEE_SMC_RETURN_IS_RPC(res.a0)) {
+			if (need_resched())
+				cond_resched();
 			param.a0 = res.a0;
 			param.a1 = res.a1;
 			param.a2 = res.a2;
@@ -170,7 +164,6 @@ u32 optee_do_call_with_arg(struct tee_context *ctx, phys_addr_t parg)
 	}
 
 	optee_rpc_finalize_call(&call_ctx);
-
 	/*
 	 * We're done with our thread in secure world, if there's any
 	 * thread waiters wake up one.
@@ -225,6 +218,7 @@ int optee_open_session(struct tee_context *ctx,
 	struct optee_msg_arg *msg_arg;
 	phys_addr_t msg_parg;
 	struct optee_session *sess = NULL;
+	uuid_t client_uuid;
 
 	/* +2 for the meta parameters added below */
 	shm = get_msg_arg(ctx, arg->num_params + 2, &msg_arg, &msg_parg);
@@ -243,8 +237,13 @@ int optee_open_session(struct tee_context *ctx,
 	msg_arg->params[1].attr = OPTEE_MSG_ATTR_TYPE_VALUE_INPUT |
 				  OPTEE_MSG_ATTR_META;
 	memcpy(&msg_arg->params[0].u.value, arg->uuid, sizeof(arg->uuid));
-	memcpy(&msg_arg->params[1].u.value, arg->uuid, sizeof(arg->clnt_uuid));
 	msg_arg->params[1].u.value.c = arg->clnt_login;
+
+	rc = tee_session_calc_client_uuid(&client_uuid, arg->clnt_login,
+					  arg->clnt_uuid);
+	if (rc)
+		goto out;
+	uuid_copy((uuid_t *) msg_arg->params[1].u.octets, &client_uuid);
 
 	rc = optee_to_msg_param(msg_arg->params + 2, arg->num_params, param);
 	if (rc)
@@ -415,11 +414,13 @@ void optee_enable_shm_cache(struct optee *optee)
 }
 
 /**
- * optee_disable_shm_cache() - Disables caching of some shared memory allocation
- *			      in OP-TEE
+ * __optee_disable_shm_cache() - Disables caching of some shared memory
+ *                               allocation in OP-TEE
  * @optee:	main service struct
+ * @is_mapped:	true if the cached shared memory addresses were mapped by this
+ *		kernel, are safe to dereference, and should be freed
  */
-void __optee_disable_shm_cache(struct optee *optee, bool is_mapped)
+static void __optee_disable_shm_cache(struct optee *optee, bool is_mapped)
 {
 	struct optee_call_waiter w;
 
@@ -640,7 +641,7 @@ int optee_shm_register(struct tee_context *ctx, struct tee_shm *shm,
 
 	msg_arg->cmd = OPTEE_MSG_CMD_REGISTER_SHM;
 	msg_arg->params->attr = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT |
-				OPTEE_MSG_ATTR_FRAGMENT;
+				OPTEE_MSG_ATTR_NONCONTIG;
 	msg_arg->params->u.tmem.shm_ref = (unsigned long)shm;
 	msg_arg->params->u.tmem.size = tee_shm_get_size(shm);
 	/*
@@ -681,5 +682,21 @@ int optee_shm_unregister(struct tee_context *ctx, struct tee_shm *shm)
 		rc = -EINVAL;
 	tee_shm_free(shm_arg);
 	return rc;
+}
+
+int optee_shm_register_supp(struct tee_context *ctx, struct tee_shm *shm,
+			    struct page **pages, size_t num_pages,
+			    unsigned long start)
+{
+	/*
+	 * We don't want to register supplicant memory in OP-TEE.
+	 * Instead information about it will be passed in RPC code.
+	 */
+	return check_mem_type(start, num_pages);
+}
+
+int optee_shm_unregister_supp(struct tee_context *ctx, struct tee_shm *shm)
+{
+	return 0;
 }
 
