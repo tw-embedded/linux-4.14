@@ -195,8 +195,8 @@ struct tee_shm *tee_shm_register(struct tee_context *ctx, unsigned long addr,
 	}
 
 	if (flags & TEE_SHM_USER_MAPPED) {
-		// alix: not pin & unpin for performance
-		rc = num_pages; //rc = pin_user_pages_fast(start, num_pages, FOLL_WRITE, shm->pages);
+		// alix: pin with the old api which just increase the ref count
+		rc = get_user_pages_fast(start, num_pages, FOLL_WRITE, shm->pages); //pin_user_pages_fast(start, num_pages, FOLL_WRITE, shm->pages);
 	} else {
 		struct kvec *kiov;
 		int i;
